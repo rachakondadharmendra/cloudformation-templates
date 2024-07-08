@@ -1,0 +1,105 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Deploy Helm chart to EKS using CloudFormation and SSM Run Command with proper permissions'
+
+Parameters:
+  EKSClusterName:
+    Type: String
+    Description: Name of the EKS cluster
+    Default: 'my-eks-cluster'
+  EC2InstanceId:
+    Type: AWS::EC2::Instance::Id
+    Description: ID of the EC2 instance to run commands on
+    Default: 'i-0123456789abcdef0'
+
+Resources:
+  EKSAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EKSClusterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                Resource: !Sub 'arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/${EKSClusterName}'
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref EKSAccessRole
+
+  UpdateEC2InstanceProfile:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceId: !Ref EC2InstanceId
+      IamInstanceProfile: !Ref EC2InstanceProfile
+
+  UpdateEKSConfigMap:
+    Type: AWS::EKS::Addon
+    Properties:
+      AddonName: vpc-cni
+      ClusterName: !Ref EKSClusterName
+      ResolveConflicts: OVERWRITE
+    DependsOn: UpdateEC2InstanceProfile
+
+  HelmDeployment:
+    Type: AWS::SSM::Association
+    DependsOn: UpdateEKSConfigMap
+    Properties:
+      Name: AWS-RunShellScript
+      Targets: 
+        - Key: InstanceIds
+          Values: 
+            - !Ref EC2InstanceId
+      Parameters:
+        commands: 
+          - |
+            #!/bin/bash
+            set -e
+
+            # Update system packages
+            sudo yum update -y
+
+            # Install AWS CLI v2
+            curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+            unzip awscliv2.zip
+            sudo ./aws/install
+
+            # Install kubectl
+            curl -o kubectl https://amazon-eks.s3.us-west-2.amazonaws.com/1.21.2/2021-07-05/bin/linux/amd64/kubectl
+            chmod +x ./kubectl
+            sudo mv ./kubectl /usr/local/bin/kubectl
+
+            # Install Helm
+            curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
+            chmod 700 get_helm.sh
+            ./get_helm.sh
+
+            # Set up kubeconfig
+            aws eks get-token --cluster-name ${EKSClusterName} > /tmp/token.json
+            kubectl apply -f /tmp/token.json
+
+            # Add Helm repo and install chart
+            helm repo add examples https://helm.github.io/examples
+            helm install ahoy examples/hello-world
+
+Outputs:
+  HelmDeploymentStatus:
+    Description: 'Helm Deployment Status'
+    Value: !Ref HelmDeployment

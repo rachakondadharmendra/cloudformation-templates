@@ -1,0 +1,244 @@
+---
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Amazon EKS Cluster with improved access management'
+
+Parameters:
+  ClusterName:
+    Type: String
+    Default: my-eks-cluster-v7
+  NumberOfWorkerNodes:
+    Type: Number
+    Default: 1
+  WorkerNodesInstanceType:
+    Type: String
+    Default: t3.small
+  KubernetesVersion:
+    Type: String
+    Default: 1.28
+  AdditionalUserArn:
+    Type: String
+    Default: arn:aws:iam::079711632559:user/admin
+    Description: ARN of the additional user to be granted cluster admin access
+
+
+Resources:
+  ###########################################
+  ## Roles
+  ###########################################
+  EksRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      RoleName: !Sub "${ClusterName}-eks-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonEKSClusterPolicy"
+
+  EksNodeRole:
+    Type: AWS::IAM::Role
+    Properties: 
+      RoleName: !Sub "${ClusterName}-node-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy"
+        - "arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly"
+        - "arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy"
+
+  ###########################################
+  ## Eks Cluster
+  ###########################################
+  EksCluster:
+    Type: AWS::EKS::Cluster
+    Properties:
+      Name: !Ref ClusterName
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EksRole.Arn
+      ResourcesVpcConfig:
+        SecurityGroupIds:
+          - !ImportValue ControlPlaneSecurityGroupId
+        SubnetIds: !Split [ ',', !ImportValue PrivateSubnetIds ]
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+
+  EksNodegroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn: EksCluster
+    Properties:
+      ClusterName: !Ref ClusterName
+      NodeRole: !GetAtt EksNodeRole.Arn
+      ScalingConfig:
+        MinSize: !Ref NumberOfWorkerNodes
+        DesiredSize: !Ref NumberOfWorkerNodes
+        MaxSize: !Ref NumberOfWorkerNodes
+      InstanceTypes: 
+        - !Ref WorkerNodesInstanceType
+      Subnets: !Split [ ',', !ImportValue PrivateSubnetIds ]
+
+  ###########################################
+  ## Additional User Access
+  ###########################################
+  EksAdditionalUserAccess:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !Ref AdditionalUserArn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+  
+  ###########################################
+  ## IAM Configuration for Cluster Access
+  ###########################################
+  ClusterAccessPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ClusterName}-access-policy"
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - eks:DescribeCluster
+              - eks:ListClusters
+            Resource: '*'
+
+  ClusterAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ClusterName}-access-role"
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref ClusterAccessPolicy
+
+
+  ###########################################
+  ## Lambda Function for Helm Installation
+  ###########################################
+  HelmInstallerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EKSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                Resource: !GetAtt EksCluster.Arn
+
+  HelmInstallerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt HelmInstallerRole.Arn
+      Runtime: python3.9
+      Timeout: 600
+      Code:
+        ZipFile: |
+          import boto3
+          import subprocess
+          import time
+          import cfnresponse
+
+          def handler(event, context):
+              if event['RequestType'] == 'Create':
+                  cluster_name = event['ResourceProperties']['ClusterName']
+                  try:
+                      eks_client = boto3.client('eks')
+                      
+                      # Wait for the cluster to be active
+                      print(f"Waiting for cluster {cluster_name} to be active...")
+                      waiter = eks_client.get_waiter('cluster_active')
+                      waiter.wait(
+                          name=cluster_name,
+                          WaiterConfig={
+                              'Delay': 30,
+                              'MaxAttempts': 40
+                          }
+                      )
+                      print(f"Cluster {cluster_name} is now active")
+
+                      # Wait a bit more for nodes to be ready
+                      time.sleep(60)
+                      
+                      # Update kubeconfig
+                      subprocess.run(['aws', 'eks', 'get-token', '--cluster-name', cluster_name], check=True)
+                      subprocess.run(['aws', 'eks', 'update-kubeconfig', '--name', cluster_name], check=True)
+                      
+                      # Install Helm chart
+                      subprocess.run(['helm', 'repo', 'add', 'examples', 'https://helm.github.io/examples'], check=True)
+                      subprocess.run(['helm', 'install', 'ahoy', 'examples/hello-world'], check=True)
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Helm chart installed successfully'})
+                  except Exception as e:
+                      print(f"Error: {str(e)}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'No action required'})
+
+  HelmInstaller:
+    Type: Custom::HelmInstaller
+    DependsOn: EksNodegroup
+    Properties:
+      ServiceToken: !GetAtt HelmInstallerFunction.Arn
+      ClusterName: !Ref ClusterName
+    
+
+Outputs:
+  ClusterName:
+    Description: The name of the EKS cluster
+    Value: !Ref EksCluster
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterName"
+  ClusterArn:
+    Description: The ARN of the EKS cluster
+    Value: !GetAtt EksCluster.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterArn"
+  ClusterAccessRoleArn:
+    Description: The ARN of the IAM role for cluster access
+    Value: !GetAtt ClusterAccessRole.Arn
+    Export:
+      Name: !Sub "${AWS::StackName}-ClusterAccessRoleArn"
+  HelmInstallationStatus:
+    Description: Status of Helm chart installation
+    Value: !GetAtt HelmInstaller.Message      
+  AdditionalUserAccess:
+    Description: The additional user granted cluster admin access
+    Value: !Ref AdditionalUserArn    

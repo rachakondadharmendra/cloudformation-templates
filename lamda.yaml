@@ -1,0 +1,106 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Standalone Lambda function for Helm chart installation on EKS
+
+Parameters:
+  ExistingClusterName:
+    Type: String
+    Description: Name of the existing EKS cluster
+
+Resources:
+  HelmInstallerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EKSAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                Resource: '*'
+        - PolicyName: EKSPodExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:*
+                Resource: '*'
+
+  HelmInstallerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt HelmInstallerRole.Arn
+      Runtime: python3.9
+      Timeout: 900
+      Code:
+        ZipFile: |
+          import boto3
+          import subprocess
+          import time
+          import os
+          import cfnresponse
+
+          def handler(event, context):
+              if event['RequestType'] == 'Create':
+                  cluster_name = event['ResourceProperties']['ClusterName']
+                  try:
+                      eks_client = boto3.client('eks')
+                      
+                      # Wait for the cluster to be active
+                      print(f"Waiting for cluster {cluster_name} to be active...")
+                      waiter = eks_client.get_waiter('cluster_active')
+                      waiter.wait(
+                          name=cluster_name,
+                          WaiterConfig={
+                              'Delay': 30,
+                              'MaxAttempts': 40
+                          }
+                      )
+                      print(f"Cluster {cluster_name} is now active")
+
+                      # Get cluster info
+                      cluster_info = eks_client.describe_cluster(name=cluster_name)
+                      cluster_endpoint = cluster_info['cluster']['endpoint']
+                      cluster_ca = cluster_info['cluster']['certificateAuthority']['data']
+                      
+                      # Update kubeconfig
+                      os.environ['KUBECONFIG'] = '/tmp/kubeconfig'
+                      subprocess.run(['aws', 'eks', 'get-token', '--cluster-name', cluster_name], check=True)
+                      subprocess.run(['aws', 'eks', 'update-kubeconfig', '--name', cluster_name, '--kubeconfig', '/tmp/kubeconfig'], check=True)
+                      
+                      # Install Helm chart
+                      subprocess.run(['helm', 'repo', 'add', 'examples', 'https://helm.github.io/examples'], check=True)
+                      subprocess.run(['helm', 'install', 'ahoy', 'examples/hello-world', '--kubeconfig', '/tmp/kubeconfig'], check=True)
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'Helm chart installed successfully'})
+                  except Exception as e:
+                      print(f"Error: {str(e)}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {'Message': 'No action required'})
+
+  HelmInstaller:
+    Type: Custom::HelmInstaller
+    Properties:
+      ServiceToken: !GetAtt HelmInstallerFunction.Arn
+      ClusterName: !Ref ExistingClusterName
+
+Outputs:
+  HelmInstallerFunctionArn:
+    Description: ARN of the Helm Installer Lambda Function
+    Value: !GetAtt HelmInstallerFunction.Arn
+  HelmInstallationStatus:
+    Description: Status of Helm chart installation
+    Value: !GetAtt HelmInstaller.Message
