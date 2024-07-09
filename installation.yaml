@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to create an EC2 instance for Helm deployment with comprehensive cleanup'
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+  EKSClusterName:
+    Description: Name of the existing EKS cluster
+    Type: String
+  HelmChartRepo:
+    Description: Helm chart repository URL
+    Type: String
+    Default: https://charts.bitnami.com/bitnami
+  HelmChartName:
+    Description: Helm chart name to deploy
+    Type: String
+    Default: nginx
+  HelmReleaseName:
+    Description: Helm release name
+    Type: String
+    Default: my-release
+
+Resources:
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AdministratorAccess  # Consider using a more restrictive policy in production
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-0aa7d40eeae50c9a9  # Amazon Linux 2023 AMI (adjust for your region)
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y aws-cli jq
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          mv kubectl /usr/local/bin/
+          curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+          aws eks update-kubeconfig --name ${EKSClusterName} --region ${AWS::Region}
+          
+          # Perform Helm deployment
+          helm repo add myrepo ${HelmChartRepo}
+          helm install ${HelmReleaseName} myrepo/${HelmChartName}
+          
+          # Wait for deployment to complete (adjust sleep time as needed)
+          sleep 300
+          
+          # Clean up Helm release
+          helm uninstall ${HelmReleaseName}
+          
+          # Trigger Lambda to delete CloudFormation stack
+          aws lambda invoke --function-name ${CleanupFunction.Arn} --payload '{"StackName": "${AWS::StackName}"}' response.json
+          
+          # Self-terminate the instance
+          instance_id=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+          aws ec2 terminate-instances --instance-ids $instance_id --region ${AWS::Region}
+      Tags:
+        - Key: Name
+          Value: EKS-Helm-Deployer-Cleanup
+
+  EKSClusterAccess:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EKSClusterName
+      PrincipalArn: !GetAtt EC2Role.Arn
+      Type: STANDARD
+
+  CleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudFormationDeleteStack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DeleteStack
+                Resource: !Sub arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*
+
+  CleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt CleanupRole.Arn
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import time
+
+          def handler(event, context):
+            cf_client = boto3.client('cloudformation')
+            stack_name = event['StackName']
+            
+            try:
+              cf_client.delete_stack(StackName=stack_name)
+              
+              # Wait for stack deletion to complete
+              waiter = cf_client.get_waiter('stack_delete_complete')
+              waiter.wait(StackName=stack_name)
+              
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {'message': f'Stack {stack_name} deleted successfully'})
+            except Exception as e:
+              cfnresponse.send(event, context, cfnresponse.FAILED, {'error': str(e)})
+
+Outputs:
+  CleanupFunctionArn:
+    Description: ARN of the Cleanup Lambda Function
+    Value: !GetAtt CleanupFunction.Arn

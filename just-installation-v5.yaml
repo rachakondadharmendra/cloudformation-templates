@@ -1,0 +1,131 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for EC2 instance with EKS access and verified command execution'
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t3.medium
+  EKSClusterName:
+    Description: Name of the EKS cluster
+    Type: String
+    Default: my-eks-cluster-v7
+
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT30M
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-06d753822bd94c64e  
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          
+          # Function to log messages
+          log_message() {
+            echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" >> /var/log/user-data.log
+          }
+
+          # Function to execute command and check result
+          execute_command() {
+            local cmd="$1"
+            local description="$2"
+            
+            log_message "Executing: $description"
+            if $cmd >> /var/log/user-data.log 2>&1; then
+              log_message "Success: $description"
+            else
+              log_message "Failed: $description"
+              /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+              exit 1
+            fi
+          }
+
+          # Start execution
+          log_message "Starting UserData script execution"
+
+          # Configure kubectl for EKS
+          log_message "Waiting for 60 seconds before configuring kubectl"
+          sleep 60
+
+          execute_command "cd ~/" "Change to home directory"
+          
+          execute_command " aws eks update-kubeconfig --name my-eks-cluster-v7 --region ap-southeast-1" "Configure kubectl for EKS"
+
+          # Verify kubectl configuration
+          if kubectl get nodes >> /var/log/user-data.log 2>&1; then
+            log_message "kubectl successfully configured and can access the cluster"
+          else
+            log_message "kubectl configuration failed or cannot access the cluster"
+            /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+            exit 1
+          fi
+
+          # Perform Helm deployment
+          execute_command "helm repo add examples https://helm.github.io/examples" "Add Helm repository"
+          execute_command "helm install ahoy examples/hello-world" "Install Helm chart"
+
+          # Verify Helm deployment
+          if helm list | grep ahoy >> /var/log/user-data.log 2>&1; then
+            log_message "Helm deployment 'ahoy' successfully installed"
+          else
+            log_message "Helm deployment 'ahoy' installation failed"
+            /opt/aws/bin/cfn-signal -e 1 --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+            exit 1
+          fi
+
+          log_message "UserData script execution completed successfully"
+          /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource EC2Instance --region ${AWS::Region}
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles: 
+        - !Ref EC2Role
+
+  EksAdditionalRoleAccess:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EKSClusterName
+      PrincipalArn: !GetAtt EC2Role.Arn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EKSClusterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListClusters
+                Resource: '*'
+
+Outputs:
+  InstanceId:
+    Description: ID of the EC2 instance
+    Value: !Ref EC2Instance

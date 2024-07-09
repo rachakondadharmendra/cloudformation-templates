@@ -1,0 +1,118 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Stack to delete another stack and then delete itself (with force delete)'
+
+Parameters:
+  TargetStackName:
+    Type: String
+    Description: Name of the stack to be deleted
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DeleteCloudFormationStack
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DeleteStack
+                  - cloudformation:DescribeStacks
+                Resource: '*'
+
+  DeleteTargetStackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import time
+
+          def handler(event, context):
+              if event['RequestType'] == 'Create':
+                  cf_client = boto3.client('cloudformation')
+                  target_stack_name = event['ResourceProperties']['TargetStackName']
+                  
+                  try:
+                      # Check if the stack exists
+                      cf_client.describe_stacks(StackName=target_stack_name)
+                      
+                      # If it exists, attempt to delete it
+                      cf_client.delete_stack(StackName=target_stack_name)
+                      
+                      # Wait for the stack to be deleted
+                      waiter = cf_client.get_waiter('stack_delete_complete')
+                      waiter.wait(StackName=target_stack_name, WaiterConfig={'Delay': 10, 'MaxAttempts': 30})
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": f"Stack {target_stack_name} deleted successfully"})
+                  except cf_client.exceptions.ClientError as e:
+                      if 'does not exist' in str(e):
+                          # If the stack doesn't exist, consider it a success
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": f"Stack {target_stack_name} does not exist"})
+                      else:
+                          # For other errors, log and return failure
+                          print(f"Error: {str(e)}")
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {"Message": f"Failed to delete stack {target_stack_name}: {str(e)}"})
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+      Runtime: python3.8
+      Timeout: 300
+
+  DeleteTargetStack:
+    Type: Custom::DeleteTargetStack
+    Properties:
+      ServiceToken: !GetAtt DeleteTargetStackFunction.Arn
+      TargetStackName: !Ref TargetStackName
+
+  DeleteSelfFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import time
+
+          def handler(event, context):
+              if event['RequestType'] == 'Create':
+                  cf_client = boto3.client('cloudformation')
+                  stack_name = event['ResourceProperties']['StackName']
+                  
+                  try:
+                      time.sleep(30)  # Wait a bit to ensure the previous deletion is complete
+                      cf_client.delete_stack(StackName=stack_name)
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": f"Deleting stack {stack_name}"})
+                  except Exception as e:
+                      print(f"Error: {str(e)}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {"Message": f"Failed to initiate deletion of stack {stack_name}: {str(e)}"})
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+      Runtime: python3.8
+      Timeout: 60
+
+  DeleteSelf:
+    Type: Custom::DeleteSelf
+    DependsOn: DeleteTargetStack
+    Properties:
+      ServiceToken: !GetAtt DeleteSelfFunction.Arn
+      StackName: !Ref AWS::StackName
+
+Outputs:
+  Message:
+    Description: Deletion Status
+    Value: "Target stack and this stack are being deleted"

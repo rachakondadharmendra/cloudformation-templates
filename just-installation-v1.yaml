@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Deploy Helm chart to EKS using CloudFormation with proper permissions in Singapore region'
+
+Parameters:
+  EKSClusterName:
+    Type: String
+    Description: Name of the EKS cluster
+    Default: 'my-eks-cluster'
+  EC2InstanceType:
+    Type: String
+    Description: EC2 instance type
+    Default: 't3.micro'
+
+Resources:
+  EKSAccessRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EKSClusterAdminAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:*
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: '*'
+                Condition:
+                  StringEquals:
+                    iam:PassedToService: eks.amazonaws.com
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles:
+        - !Ref EKSAccessRole
+
+  DefaultVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      InstanceTenancy: default
+
+  DefaultSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref DefaultVPC
+      AvailabilityZone: !Select 
+        - 0
+        - !GetAZs 
+          Ref: 'AWS::Region'
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref EC2InstanceType
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      ImageId: ami-0e4b5d31e60aa0acd  # Amazon Linux 2 AMI (HVM) in Singapore region
+      SubnetId: !Ref DefaultSubnet
+      Tags:
+        - Key: Name
+          Value: "HelmDeploymentInstance"
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          set -e
+
+          # Update system packages
+          yum update -y
+
+          # Install AWS CLI v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install
+
+          # Install kubectl
+          curl -o kubectl https://s3.us-west-2.amazonaws.com/amazon-eks/1.24.10/2023-01-30/bin/linux/amd64/kubectl
+          chmod +x ./kubectl
+          mv ./kubectl /usr/local/bin/kubectl
+
+          # Install Helm
+          curl -fsSL -o get_helm.sh https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3
+          chmod 700 get_helm.sh
+          ./get_helm.sh
+
+          # Set up kubeconfig
+          aws eks get-token --cluster-name ${EKSClusterName} | kubectl apply -f -
+
+          # Add Helm repo and install chart
+          helm repo add examples https://helm.github.io/examples
+          helm install ahoy examples/hello-world
+
+  EksAdditionalUserAccess:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EKSClusterName
+      PrincipalArn: !GetAtt EKSAccessRole.Arn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+Outputs:
+  EC2InstanceId:
+    Description: 'ID of the EC2 instance'
+    Value: !Ref EC2Instance
+  EKSAccessRoleArn:
+    Description: 'ARN of the IAM role for EKS access'
+    Value: !GetAtt EKSAccessRole.Arn
+  DefaultVPCId:
+    Description: 'ID of the Default VPC'
+    Value: !Ref DefaultVPC
+  DefaultSubnetId:
+    Description: 'ID of the Default Subnet'
+    Value: !Ref DefaultSubnet

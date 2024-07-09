@@ -1,0 +1,199 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for EC2 instance with EKS access using Session Manager and Helm deployment'
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t3.medium
+  EKSClusterName:
+    Description: Name of the EKS cluster
+    Type: String
+    Default: my-eks-cluster-v7
+
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-06d753822bd94c64e  
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Update and install dependencies
+          yum update -y
+          yum install -y docker jq
+
+          # Install AWS CLI v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install
+
+          # Install kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          mv kubectl /usr/local/bin/
+
+          # Install Helm
+          curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+
+          # Start Docker service
+          systemctl start docker
+          systemctl enable docker
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles: 
+        - !Ref EC2Role
+
+  EksAdditionalRoleAccess:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EKSClusterName
+      PrincipalArn: !GetAtt EC2Role.Arn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EKSClusterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListClusters
+                Resource: '*'
+
+  EKSCommandsExecution:
+    Type: Custom::EKSCommandsExecution
+    DependsOn: EC2Instance
+    Properties:
+      ServiceToken: !GetAtt EKSCommandsLambda.Arn
+      InstanceId: !Ref EC2Instance
+      EKSClusterName: !Ref EKSClusterName
+      Region: !Ref "AWS::Region"
+
+  EKSCommandsLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+          import cfnresponse
+
+          def handler(event, context):
+              if event['RequestType'] == 'Create':
+                  instance_id = event['ResourceProperties']['InstanceId']
+                  cluster_name = event['ResourceProperties']['EKSClusterName']
+                  region = event['ResourceProperties']['Region']
+                  
+                  ec2 = boto3.client('ec2')
+                  ssm = boto3.client('ssm')
+
+                  # Wait for the instance to be in running state
+                  waiter = ec2.get_waiter('instance_status_ok')
+                  try:
+                      waiter.wait(InstanceIds=[instance_id])
+                  except Exception as e:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+                      return
+
+                  # Run commands
+                  commands = [
+                      f"aws eks update-kubeconfig --name {cluster_name} --region {region}",
+                      "helm repo add examples https://helm.github.io/examples",
+                      "helm install ahoy examples/hello-world"
+                  ]
+
+                  try:
+                      response = ssm.send_command(
+                          InstanceIds=[instance_id],
+                          DocumentName="AWS-RunShellScript",
+                          Parameters={'commands': commands}
+                      )
+                      
+                      command_id = response['Command']['CommandId']
+                      
+                      # Wait for the command to complete
+                      while True:
+                          time.sleep(5)
+                          result = ssm.get_command_invocation(
+                              CommandId=command_id,
+                              InstanceId=instance_id
+                          )
+                          if result['Status'] in ['Success', 'Failed', 'Cancelled']:
+                              break
+
+                      if result['Status'] == 'Failed':
+                          cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": result['StandardErrorContent']})
+                      else:
+                          cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Output": result['StandardOutputContent']})
+                  except Exception as e:
+                      cfnresponse.send(event, context, cfnresponse.FAILED, {"Error": str(e)})
+              else:
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {"Message": "No action required"})
+
+      Runtime: python3.8
+      Timeout: 300
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: LambdaSSMAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:SendCommand
+                  - ssm:GetCommandInvocation
+                  - ec2:DescribeInstanceStatus
+                Resource: '*'
+        - PolicyName: LambdaCloudWatchLogsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+
+Outputs:
+  InstanceId:
+    Description: ID of the EC2 instance
+    Value: !Ref EC2Instance

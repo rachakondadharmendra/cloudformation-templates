@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for EC2 instance with EKS access using Session Manager and Helm deployment'
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t3.medium
+  EKSClusterName:
+    Description: Name of the EKS cluster
+    Type: String
+    Default: my-eks-cluster-v7    
+
+Resources:
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-06d753822bd94c64e  
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Update and install dependencies
+          yum update -y
+          yum install cronie -y 
+          service crond start
+          yum install -y docker jq
+      
+          # Install AWS CLI v2
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip awscliv2.zip
+          ./aws/install
+      
+          # Install kubectl
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          mv kubectl /usr/local/bin/
+      
+          # Install Helm
+          curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+      
+          # Start Docker service
+          systemctl start docker
+          systemctl enable docker
+      
+          # Configure kubectl for EKS
+          cd ~/
+          sleep 60
+          aws eks update-kubeconfig --name my-eks-cluster-v7 --region ap-southeast-1
+      
+          # Perform Helm deployment
+          helm repo add examples https://helm.github.io/examples
+          helm install ahoy examples/hello-world
+      
+          # Create the cronjob script
+          cat << 'EOF' > /usr/local/bin/eks-helm-check.sh
+          #!/bin/bash
+      
+          # Check EKS cluster connection
+          aws eks update-kubeconfig --name my-eks-cluster-v7 --region ap-southeast-1
+          curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+          /usr/local/bin/helm repo add examples https://helm.github.io/examples
+          /usr/local/bin/helm install ahoy examples/hello-world
+          EOF
+      
+          # Make the script executable
+          chmod +x /usr/local/bin/eks-helm-check.sh
+      
+          # Add cronjob to check EKS and Helm every minute
+          echo "* * * * * /usr/local/bin/eks-helm-check.sh >> /var/log/eks-helm-check.log 2>&1" | crontab -
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: "/"
+      Roles: 
+        - !Ref EC2Role
+
+  EksAdditionalRoleAccess:
+      Type: AWS::EKS::AccessEntry
+      Properties:
+        ClusterName: !Ref EKSClusterName
+        PrincipalArn: !GetAtt EC2Role.Arn
+        Type: STANDARD
+        AccessPolicies:
+          - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+            AccessScope:
+              Type: cluster
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - arn:aws:iam::aws:policy/AmazonEKS_CNI_Policy
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: EKSClusterAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:ListClusters
+                Resource: '*'
+
+  DeleteResourcesFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt DeleteResourcesRole.Arn
+      Runtime: python3.8
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          import time
+
+          def delete_resource(client, resource_type, resource_id):
+              if resource_type == 'AWS::EC2::Instance':
+                  client.terminate_instances(InstanceIds=[resource_id])
+              elif resource_type == 'AWS::IAM::InstanceProfile':
+                  client.delete_instance_profile(InstanceProfileName=resource_id)
+              elif resource_type == 'AWS::EKS::AccessEntry':
+                  eks = boto3.client('eks')
+                  eks.delete_access_entry(clusterName='my-eks-cluster-v7', accessEntryArn=resource_id)
+              elif resource_type == 'AWS::IAM::Role':
+                  for policy in client.list_attached_role_policies(RoleName=resource_id)['AttachedPolicies']:
+                      client.detach_role_policy(RoleName=resource_id, PolicyArn=policy['PolicyArn'])
+                  for policy in client.list_role_policies(RoleName=resource_id)['PolicyNames']:
+                      client.delete_role_policy(RoleName=resource_id, PolicyName=policy)
+                  client.delete_role(RoleName=resource_id)
+
+          def handler(event, context):
+              try:
+                  ec2 = boto3.client('ec2')
+                  iam = boto3.client('iam')
+
+                  # Delete EC2 Instance
+                  delete_resource(ec2, 'AWS::EC2::Instance', event['ResourceProperties']['EC2InstanceId'])
+
+                  # Wait for instance termination
+                  waiter = ec2.get_waiter('instance_terminated')
+                  waiter.wait(InstanceIds=[event['ResourceProperties']['EC2InstanceId']])
+
+                  # Delete EKS Access Entry
+                  delete_resource(iam, 'AWS::EKS::AccessEntry', event['ResourceProperties']['EksAccessEntryArn'])
+
+                  # Delete IAM Instance Profile
+                  delete_resource(iam, 'AWS::IAM::InstanceProfile', event['ResourceProperties']['EC2InstanceProfileName'])
+
+                  # Delete IAM Role
+                  delete_resource(iam, 'AWS::IAM::Role', event['ResourceProperties']['EC2RoleName'])
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  print(e)
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  DeleteResourcesRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DeleteResources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:TerminateInstances
+                  - ec2:DescribeInstances
+                  - iam:DeleteInstanceProfile
+                  - iam:RemoveRoleFromInstanceProfile
+                  - iam:DeleteRole
+                  - iam:DeleteRolePolicy
+                  - iam:DetachRolePolicy
+                  - iam:ListAttachedRolePolicies
+                  - iam:ListRolePolicies
+                  - eks:DeleteAccessEntry
+                Resource: '*'
+
+  DeleteResourcesRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DeleteResourcesFunction.Arn
+          Id: DeleteResourcesTarget
+          Input: !Sub |
+            {
+              "ResourceProperties": {
+                "EC2InstanceId": "${EC2Instance}",
+                "EC2InstanceProfileName": "${EC2InstanceProfile}",
+                "EksAccessEntryArn": "${EksAdditionalRoleAccess}",
+                "EC2RoleName": "${EC2Role}"
+              }
+            }
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DeleteResourcesFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DeleteResourcesRule.Arn
+  
+Outputs:
+  InstanceId:
+    Description: ID of the EC2 instance
+    Value: !Ref EC2Instance

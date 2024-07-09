@@ -1,0 +1,171 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template to create an EC2 instance for Helm deployment with comprehensive cleanup'
+
+Parameters:
+  InstanceType:
+    Description: EC2 instance type
+    Type: String
+    Default: t2.micro
+  EKSClusterName:
+    Description: Name of the existing EKS cluster
+    Type: String
+
+Resources:
+  AdminUser:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: !Sub "${AWS::StackName}-AdminUser"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  AdminUserAccessKey:
+    Type: AWS::IAM::AccessKey
+    Properties:
+      UserName: !Ref AdminUser
+
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AdministratorAccess
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: ami-0497a974f8d5dcef8  # Ubuntu 22.04LTS
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y aws-cli jq
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          mv kubectl /usr/local/bin/
+          curl https://raw.githubusercontent.com/helm/helm/master/scripts/get-helm-3 | bash
+          aws eks update-kubeconfig --name ${EKSClusterName} --region ${AWS::Region}
+          
+          # Perform Helm deployment
+          helm repo add examples https://helm.github.io/examples
+          helm install ahoy examples/hello-world
+          
+          # Trigger Lambda to clean up resources
+          instance_id=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
+          aws lambda invoke --function-name ${CleanupFunction.Arn} --payload "{\"InstanceId\": \"$instance_id\", \"StackName\": \"${AWS::StackName}\", \"EKSClusterName\": \"${EKSClusterName}\", \"EC2RoleArn\": \"${EC2Role.Arn}\"}" response.json
+          
+          # Stop the instance (not terminate, as Lambda will handle termination)
+          shutdown -h now
+      Tags:
+        - Key: Name
+          Value: EKS-Helm-Deployer-Cleanup
+
+  EKSClusterAccess:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EKSClusterName
+      PrincipalArn: !GetAtt EC2Role.Arn
+      Type: STANDARD
+
+  CleanupRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2AndResourceCleanup
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeInstances
+                  - ec2:TerminateInstances
+                  - iam:DeleteAccessKey
+                  - iam:DeleteUser
+                  - eks:DeleteAccessEntry
+                  - cloudformation:DeleteStack
+                  - lambda:DeleteFunction
+                Resource: '*'
+
+  CleanupFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt CleanupRole.Arn
+      Runtime: python3.8
+      Timeout: 300
+      Code:
+        ZipFile: |
+          import boto3
+          import time
+
+          def handler(event, context):
+              ec2_client = boto3.client('ec2')
+              iam_client = boto3.client('iam')
+              eks_client = boto3.client('eks')
+              cf_client = boto3.client('cloudformation')
+              lambda_client = boto3.client('lambda')
+              
+              instance_id = event['InstanceId']
+              stack_name = event['StackName']
+              eks_cluster_name = event['EKSClusterName']
+              ec2_role_arn = event['EC2RoleArn']
+              
+              # Wait for the instance to stop
+              while True:
+                  response = ec2_client.describe_instances(InstanceIds=[instance_id])
+                  state = response['Reservations'][0]['Instances'][0]['State']['Name']
+                  if state == 'stopped':
+                      break
+                  time.sleep(10)
+              
+              # Terminate the EC2 instance
+              ec2_client.terminate_instances(InstanceIds=[instance_id])
+              
+              # Delete the IAM user and access key
+              user_name = f"{stack_name}-AdminUser"
+              access_keys = iam_client.list_access_keys(UserName=user_name)['AccessKeyMetadata']
+              for key in access_keys:
+                  iam_client.delete_access_key(UserName=user_name, AccessKeyId=key['AccessKeyId'])
+              iam_client.delete_user(UserName=user_name)
+              
+              # Delete the EKS AccessEntry
+              eks_client.delete_access_entry(clusterName=eks_cluster_name, principalArn=ec2_role_arn)
+              
+              # Delete the CloudFormation stack
+              cf_client.delete_stack(StackName=stack_name)
+              
+              # Delete this Lambda function
+              lambda_client.delete_function(FunctionName=context.function_name)
+              
+              return {
+                  'statusCode': 200,
+                  'body': 'Cleanup completed successfully'
+              }
+
+Outputs:
+  CleanupFunctionArn:
+    Description: ARN of the Cleanup Lambda Function
+    Value: !GetAtt CleanupFunction.Arn

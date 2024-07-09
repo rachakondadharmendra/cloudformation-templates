@@ -1,0 +1,73 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for deleting another stack'
+
+Parameters:
+  TargetStackName:
+    Type: String
+    Description: Name of the stack to be deleted
+    Default: final-lamda-yaml
+
+Resources:
+  DeleteStackFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt DeleteStackRole.Arn
+      Runtime: python3.8
+      Code:
+        ZipFile: |
+          import boto3
+          import cfnresponse
+          def handler(event, context):
+            cf = boto3.client('cloudformation')
+            try:
+              cf.delete_stack(StackName=event['ResourceProperties']['StackName'])
+              cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+            except Exception as e:
+              print(e)
+              cfnresponse.send(event, context, cfnresponse.FAILED, {})
+
+  DeleteStackRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DeleteCloudFormationStackAndResources
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cloudformation:DeleteStack
+                  - eks:*
+                  - ec2:*
+                  - iam:*
+                  - lambda:*
+                  - events:*
+                Resource: '*'
+
+  DeleteStackRule:
+    Type: AWS::Events::Rule
+    Properties:
+      ScheduleExpression: rate(1 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt DeleteStackFunction.Arn
+          Id: DeleteStackTarget
+          Input: !Sub '{"ResourceProperties": {"StackName": "${TargetStackName}"}}'
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref DeleteStackFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DeleteStackRule.Arn
